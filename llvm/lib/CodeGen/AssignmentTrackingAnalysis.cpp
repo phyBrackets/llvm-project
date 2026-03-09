@@ -1708,7 +1708,7 @@ void AssignmentTrackingLowering::processEscapingCall(
                       << FnVarLocs->getVariable(Var).getVariable()->getName()
                       << ", setting LocKind to Mem\n");
 
-    // Emit a memory location def, the variable lives at `*Base`
+    // Emit a memory location def, the variable lives at `*Base`.
     DebugVariable V = FnVarLocs->getVariable(Var);
     DIExpression *DIE = DIExpression::get(I.getContext(), {});
     if (auto Frag = V.getFragment()) {
@@ -1717,7 +1717,7 @@ void AssignmentTrackingLowering::processEscapingCall(
       assert(R && "unexpected createFragmentExpression failue");
       DIE = *R;
     }
-    // Add implicit deref (the alloca address points to the variable's memory)
+    // Add implicit deref (the alloca address points to the variable's memory).
     DIE = DIExpression::prepend(DIE, DIExpression::DerefAfter, /*Offset=*/0);
 
     auto InsertBefore = getNextNode(&I);
@@ -2170,8 +2170,10 @@ AllocaInst *getUnknownStore(const Instruction &I, const DataLayout &Layout) {
 /// subsequent variables are either stack homed or fully promoted.
 ///
 /// Finally, populate UntaggedStoreVars with a mapping of untagged stores to
-/// the stored-to variable fragments, and UnknownStoreVars with a mapping
-/// of untagged unknown stores to the stored-to variable aggregates.
+/// the stored-to variable fragments, UnknownStoreVars with a mapping of
+/// untagged unknown stores to the stored-to variable aggregates, and
+/// EscapingCallVars with a mapping of calls that receive a pointer to a
+/// tracked alloca as an argument to the variables they may modify.
 ///
 /// These tasks are bundled together to reduce the number of times we need
 /// to iterate over the function as they can be achieved together in one pass.
@@ -2266,40 +2268,49 @@ static AssignmentTrackingLowering::OverlapMap buildOverlapMapAndRecordDeclares(
           HandleDbgAssignForUnknownStore(DVR);
       }
 
-      // Check for escaping calls
-      if (auto *CB = dyn_cast<CallBase>(&I)) {
-        // Skip intrinsics, their memory effects are modeled individually
-        if (!isa<IntrinsicInst>(CB) && !CB->onlyReadsMemory()) {
-          DenseSet<VariableID> SeenVars;
-          for (unsigned ArgIdx = 0; ArgIdx < CB->arg_size(); ++ArgIdx) {
-            Value *Arg = CB->getArgOperand(ArgIdx);
-            if (!Arg->getType()->isPointerTy())
-              continue;
-            if (CB->paramHasAttr(ArgIdx, Attribute::ReadOnly) ||
-                CB->paramHasAttr(ArgIdx, Attribute::ReadNone))
-              continue;
-            if (CB->paramHasAttr(ArgIdx, Attribute::ByVal))
-              continue;
+      // Check for escaping calls.
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
 
-            auto *AI = dyn_cast<AllocaInst>(getUnderlyingObject(Arg));
-            if (!AI)
-              continue;
+      // Skip intrinsics.  Their memory effects are modeled individually.
+      if (isa<IntrinsicInst>(CB))
+        continue;
 
-            // Find tracked variables on this alloca. Use the whole-variable
-            // (no fragment) because we don't know which part the callee
-            // modifies. addMemDef/addDbgDef/setLocKind will propagate to
-            // contained fragments.
-            for (DbgVariableRecord *DVR : at::getDVRAssignmentMarkers(AI)) {
-              DebugVariable DV(DVR->getVariable(), std::nullopt,
-                               DVR->getDebugLoc().getInlinedAt());
-              DebugAggregate DA = {DV.getVariable(), DV.getInlinedAt()};
-              if (!VarsWithStackSlot.contains(DA))
-                continue;
-              VariableID VarID = FnVarLocs->insertVariable(DV);
-              if (SeenVars.insert(VarID).second)
-                EscapingCallVars[&I].push_back({VarID, AI});
-            }
-          }
+      // Skip calls that cannot write to memory at all.
+      if (CB->onlyReadsMemory())
+        continue;
+
+      SmallDenseSet<VariableID, 4> SeenVars;
+      for (unsigned ArgIdx = 0; ArgIdx < CB->arg_size(); ++ArgIdx) {
+        Value *Arg = CB->getArgOperand(ArgIdx);
+        if (!Arg->getType()->isPointerTy())
+          continue;
+        // Skip args the callee cannot write through.
+        if (CB->paramHasAttr(ArgIdx, Attribute::ReadOnly) ||
+            CB->paramHasAttr(ArgIdx, Attribute::ReadNone))
+          continue;
+        // Skip byval args.  The callee gets a copy, not the original.
+        if (CB->paramHasAttr(ArgIdx, Attribute::ByVal))
+          continue;
+
+        auto *AI = dyn_cast<AllocaInst>(getUnderlyingObject(Arg));
+        if (!AI)
+          continue;
+
+        // Find tracked variables on this alloca.  We use the whole-variable
+        // (no fragment) because we don't know which part the callee
+        // modifies.  addMemDef/addDbgDef/setLocKind will propagate to
+        // contained fragments.
+        for (DbgVariableRecord *DVR : at::getDVRAssignmentMarkers(AI)) {
+          DebugVariable DV(DVR->getVariable(), std::nullopt,
+                           DVR->getDebugLoc().getInlinedAt());
+          DebugAggregate DA = {DV.getVariable(), DV.getInlinedAt()};
+          if (!VarsWithStackSlot.contains(DA))
+            continue;
+          VariableID VarID = FnVarLocs->insertVariable(DV);
+          if (SeenVars.insert(VarID).second)
+            EscapingCallVars[&I].push_back({VarID, AI});
         }
       }
     }
