@@ -2304,12 +2304,9 @@ static AssignmentTrackingLowering::OverlapMap buildOverlapMapAndRecordDeclares(
         // contained fragments.
         for (DbgVariableRecord *DVR : at::getDVRAssignmentMarkers(AI)) {
           // TODO: address-modifying DIExpressions on dbg_assigns are
-          // not yet handled for escaping calls.  Assert that the
-          // address expression is empty so this site is easy to find
-          // when that support is added.
-          assert(DVR->getAddressExpression()->getNumElements() == 0 &&
-                 "Escaping call handling does not yet support "
-                 "address-modifying DIExpressions");
+          // not yet handled for escaping calls.  Skip these for now.
+          if (DVR->getAddressExpression()->getNumElements() != 0)
+            continue;
 
           DebugVariable DV(DVR->getVariable(), std::nullopt,
                            DVR->getDebugLoc().getInlinedAt());
