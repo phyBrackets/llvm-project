@@ -1081,7 +1081,7 @@ public:
       DenseMap<const Instruction *, SmallVector<VariableID>>;
   using EscapingCallVarsMap =
       DenseMap<const Instruction *,
-               SmallVector<std::pair<VariableID, const AllocaInst *>>>;
+               SmallVector<std::tuple<VariableID, Value *, DIExpression *>>>;
 
 private:
   /// The highest numbered VariableID for partially promoted variables plus 1,
@@ -1694,7 +1694,9 @@ void AssignmentTrackingLowering::processEscapingCall(
 
   LLVM_DEBUG(dbgs() << "processEscapingCall on " << I << "\n");
 
-  for (auto &[Var, Base] : It->second) {
+  const DataLayout &Layout = Fn.getDataLayout();
+
+  for (auto &[Var, Addr, AddrExpr] : It->second) {
     // An escaping call is treated like an untagged store, whatever value is
     // now in memory is the current value of the variable. We set both the
     // stack and debug assignments to NoneOrPhi (we don't know which source
@@ -1704,21 +1706,24 @@ void AssignmentTrackingLowering::processEscapingCall(
     addDbgDef(LiveSet, Var, Assignment::makeNoneOrPhi());
     setLocKind(LiveSet, Var, LocKind::Mem);
 
-    LLVM_DEBUG(dbgs() << " escaping call may modify "
+    LLVM_DEBUG(dbgs() << "  escaping call may modify "
                       << FnVarLocs->getVariable(Var).getVariable()->getName()
                       << ", setting LocKind to Mem\n");
 
-    // Emit a memory location def, the variable lives at `*Base`.
+    // Build the memory location expression using the DVR's address and
+    // address expression, following the same pattern as emitDbgValue.
     DebugVariable V = FnVarLocs->getVariable(Var);
-    DIExpression *DIE = DIExpression::get(I.getContext(), {});
+    DIExpression *Expr = AddrExpr;
+
     if (auto Frag = V.getFragment()) {
-      auto R = DIExpression::createFragmentExpression(DIE, Frag->OffsetInBits,
+      auto R = DIExpression::createFragmentExpression(Expr, Frag->OffsetInBits,
                                                       Frag->SizeInBits);
-      assert(R && "unexpected createFragmentExpression failue");
-      DIE = *R;
+      assert(R && "unexpected createFragmentExpression failure");
+      Expr = *R;
     }
-    // Add implicit deref (the alloca address points to the variable's memory).
-    DIE = DIExpression::prepend(DIE, DIExpression::DerefAfter, /*Offset=*/0);
+
+    Value *Val = Addr;
+    std::tie(Val, Expr) = walkToAllocaAndPrependOffsetDeref(Layout, Val, Expr);
 
     auto InsertBefore = getNextNode(&I);
     assert(InsertBefore && "Shouldn't be inserting after a terminator");
@@ -1729,13 +1734,14 @@ void AssignmentTrackingLowering::processEscapingCall(
 
     VarLocInfo VarLoc;
     VarLoc.VariableID = Var;
-    VarLoc.Expr = DIE;
-    VarLoc.Values = RawLocationWrapper(
-        ValueAsMetadata::get(const_cast<AllocaInst *>(Base)));
+    VarLoc.Expr = Expr;
+    VarLoc.Values =
+        RawLocationWrapper(ValueAsMetadata::get(const_cast<Value *>(Val)));
     VarLoc.DL = DILoc;
     InsertBeforeMap[InsertBefore].push_back(VarLoc);
   }
 }
+
 void AssignmentTrackingLowering::processTaggedInstruction(
     Instruction &I, AssignmentTrackingLowering::BlockInfo *LiveSet) {
   auto LinkedDPAssigns = at::getDVRAssignmentMarkers(&I);
@@ -2303,11 +2309,6 @@ static AssignmentTrackingLowering::OverlapMap buildOverlapMapAndRecordDeclares(
         // modifies.  addMemDef/addDbgDef/setLocKind will propagate to
         // contained fragments.
         for (DbgVariableRecord *DVR : at::getDVRAssignmentMarkers(AI)) {
-          // TODO: address-modifying DIExpressions on dbg_assigns are
-          // not yet handled for escaping calls.  Skip these for now.
-          if (DVR->getAddressExpression()->getNumElements() != 0)
-            continue;
-
           DebugVariable DV(DVR->getVariable(), std::nullopt,
                            DVR->getDebugLoc().getInlinedAt());
           DebugAggregate DA = {DV.getVariable(), DV.getInlinedAt()};
@@ -2315,7 +2316,8 @@ static AssignmentTrackingLowering::OverlapMap buildOverlapMapAndRecordDeclares(
             continue;
           VariableID VarID = FnVarLocs->insertVariable(DV);
           if (SeenVars.insert(VarID).second)
-            EscapingCallVars[&I].push_back({VarID, AI});
+            EscapingCallVars[&I].push_back(
+                {VarID, DVR->getAddress(), DVR->getAddressExpression()});
         }
       }
     }
